@@ -222,9 +222,17 @@ jobs:
                           WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                           WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                                   | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                                   | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                           PixelFormat.TRANSLUCENT);
                   lp.gravity = Gravity.TOP | Gravity.START;
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      lp.layoutInDisplayCutoutMode =
+                              WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+                  } else if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode =
+                              WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                  }
                   applyPrefs();
                   try {
                       wm.addView(view, lp);
@@ -304,6 +312,7 @@ jobs:
                   p = getSharedPreferences("cfg", MODE_PRIVATE);
                   DisplayMetrics dm = getResources().getDisplayMetrics();
                   int pad = (int) (16 * dm.density);
+                  int extra = 400;
 
                   ScrollView sv = new ScrollView(this);
                   LinearLayout root = new LinearLayout(this);
@@ -316,9 +325,9 @@ jobs:
                   title.setTextSize(24);
                   root.addView(title);
 
-                  addSlider(root, "Position X", "x", dm.widthPixels, 100);
-                  addSlider(root, "Position Y", "y", dm.heightPixels, 60);
-                  addSlider(root, "Size", "size", (int) (300 * dm.density), (int) (48 * dm.density));
+                  addSlider(root, "Position X", "x", -extra, dm.widthPixels + extra, 100);
+                  addSlider(root, "Position Y", "y", -extra, dm.heightPixels + extra, 60);
+                  addSlider(root, "Size", "size", (int) (20 * dm.density), (int) (300 * dm.density), (int) (48 * dm.density));
 
                   Button start = new Button(this);
                   start.setText("Show battery icon");
@@ -341,19 +350,22 @@ jobs:
                   }
               }
 
-              void addSlider(LinearLayout root, String label, String key, int max, int def) {
+              void addSlider(LinearLayout root, String label, String key, int min, int max, int def) {
                   TextView tv = new TextView(this);
                   tv.setPadding(0, 40, 0, 0);
                   SeekBar sb = new SeekBar(this);
-                  sb.setMax(max);
+                  sb.setMax(max - min);
                   int cur = p.getInt(key, def);
-                  sb.setProgress(cur);
+                  if (cur < min) cur = min;
+                  if (cur > max) cur = max;
+                  sb.setProgress(cur - min);
                   tv.setText(label + ": " + cur);
                   sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                       @Override
                       public void onProgressChanged(SeekBar s, int v, boolean user) {
-                          p.edit().putInt(key, v).apply();
-                          tv.setText(label + ": " + v);
+                          int real = v + min;
+                          p.edit().putInt(key, real).apply();
+                          tv.setText(label + ": " + real);
                           if (OverlayService.running) {
                               startService(new Intent(MainActivity.this, OverlayService.class));
                           }
