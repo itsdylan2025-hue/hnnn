@@ -1,0 +1,396 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.4
+
+      - name: Accept licenses and install SDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-33" "build-tools;33.0.2" || true
+
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/batteryicon/overlay
+
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "IOSBatteryOverlay"
+          include ':app'
+          EOF
+
+          cat > build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application' version '8.1.4' apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+
+          cat > app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.batteryicon.overlay'
+              compileSdk 33
+              defaultConfig {
+                  applicationId 'com.batteryicon.overlay'
+                  minSdk 26
+                  targetSdk 33
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_11
+                  targetCompatibility JavaVersion.VERSION_11
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:label="iOS Battery Overlay"
+                  android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/batteryicon/overlay/BatteryView.java << 'EOF'
+          package com.batteryicon.overlay;
+
+          import android.content.Context;
+          import android.graphics.*;
+          import android.view.View;
+
+          public class BatteryView extends View {
+              int level = 100;
+              boolean charging = false;
+              boolean saver = false;
+              Paint outline = new Paint(Paint.ANTI_ALIAS_FLAG);
+              Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+              Paint nub = new Paint(Paint.ANTI_ALIAS_FLAG);
+              Paint bolt = new Paint(Paint.ANTI_ALIAS_FLAG);
+              Paint boltEdge = new Paint(Paint.ANTI_ALIAS_FLAG);
+              Path boltPath = new Path();
+
+              public BatteryView(Context c) {
+                  super(c);
+                  setBackgroundColor(Color.TRANSPARENT);
+                  outline.setStyle(Paint.Style.STROKE);
+                  outline.setStrokeWidth(3.5f);
+                  outline.setColor(0x80FFFFFF);
+                  nub.setColor(0x80FFFFFF);
+                  bolt.setColor(Color.WHITE);
+                  boltEdge.setStyle(Paint.Style.STROKE);
+                  boltEdge.setStrokeWidth(3f);
+                  boltEdge.setColor(0xFF1C1C1E);
+                  boltEdge.setStrokeJoin(Paint.Join.ROUND);
+                  boltPath.moveTo(54, 2);
+                  boltPath.lineTo(36, 28);
+                  boltPath.lineTo(47, 28);
+                  boltPath.lineTo(42, 48);
+                  boltPath.lineTo(64, 20);
+                  boltPath.lineTo(52, 20);
+                  boltPath.lineTo(58, 2);
+                  boltPath.close();
+              }
+
+              void set(int lvl, boolean chg, boolean sv) {
+                  level = lvl;
+                  charging = chg;
+                  saver = sv;
+                  invalidate();
+              }
+
+              @Override
+              protected void onDraw(Canvas c) {
+                  float s = getWidth() / 100f;
+                  c.scale(s, s);
+                  c.drawRoundRect(new RectF(2, 2, 90, 48), 14, 14, outline);
+                  c.drawRoundRect(new RectF(93, 18, 99, 32), 3, 3, nub);
+
+                  int color;
+                  if (charging) color = 0xFF34C759;
+                  else if (level <= 20) color = 0xFFFF3B30;
+                  else if (saver) color = 0xFFFFCC00;
+                  else color = 0xFFFFFFFF;
+                  fill.setColor(color);
+
+                  float right = 8 + (84 - 8) * Math.max(level, 6) / 100f;
+                  c.drawRoundRect(new RectF(8, 8, right, 42), 9, 9, fill);
+
+                  if (charging) {
+                      c.drawPath(boltPath, boltEdge);
+                      c.drawPath(boltPath, bolt);
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/batteryicon/overlay/OverlayService.java << 'EOF'
+          package com.batteryicon.overlay;
+
+          import android.app.*;
+          import android.content.*;
+          import android.graphics.PixelFormat;
+          import android.os.*;
+          import android.view.Gravity;
+          import android.view.WindowManager;
+
+          public class OverlayService extends Service {
+              static boolean running = false;
+              WindowManager wm;
+              BatteryView view;
+              WindowManager.LayoutParams lp;
+              int level = 100;
+              boolean charging = false;
+
+              BroadcastReceiver receiver = new BroadcastReceiver() {
+                  @Override
+                  public void onReceive(Context c, Intent i) {
+                      if (Intent.ACTION_BATTERY_CHANGED.equals(i.getAction())) {
+                          int l = i.getIntExtra(BatteryManager.EXTRA_LEVEL, 100);
+                          int sc = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                          level = l * 100 / sc;
+                          int st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                          charging = st == BatteryManager.BATTERY_STATUS_CHARGING
+                                  || st == BatteryManager.BATTERY_STATUS_FULL;
+                      }
+                      refresh();
+                  }
+              };
+
+              void refresh() {
+                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                  view.set(level, charging, pm.isPowerSaveMode());
+              }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  nm.createNotificationChannel(new NotificationChannel("bat", "Battery overlay",
+                          NotificationManager.IMPORTANCE_MIN));
+                  Notification n = new Notification.Builder(this, "bat")
+                          .setContentTitle("Battery overlay running")
+                          .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
+                          .build();
+                  startForeground(1, n);
+
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  view = new BatteryView(this);
+                  lp = new WindowManager.LayoutParams(
+                          100, 50,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT);
+                  lp.gravity = Gravity.TOP | Gravity.START;
+                  applyPrefs();
+                  try {
+                      wm.addView(view, lp);
+                  } catch (Exception e) {
+                      stopSelf();
+                      return;
+                  }
+
+                  IntentFilter f = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+                  f.addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED);
+                  registerReceiver(receiver, f);
+                  running = true;
+              }
+
+              void applyPrefs() {
+                  SharedPreferences p = getSharedPreferences("cfg", MODE_PRIVATE);
+                  float d = getResources().getDisplayMetrics().density;
+                  int size = Math.max(p.getInt("size", (int) (48 * d)), (int) (20 * d));
+                  lp.width = size;
+                  lp.height = size / 2;
+                  lp.x = p.getInt("x", 100);
+                  lp.y = p.getInt("y", 60);
+              }
+
+              @Override
+              public int onStartCommand(Intent i, int flags, int id) {
+                  if (i != null && "STOP".equals(i.getAction())) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  applyPrefs();
+                  try {
+                      wm.updateViewLayout(view, lp);
+                  } catch (Exception ignored) {
+                  }
+                  return START_STICKY;
+              }
+
+              @Override
+              public void onDestroy() {
+                  running = false;
+                  try {
+                      unregisterReceiver(receiver);
+                  } catch (Exception ignored) {
+                  }
+                  try {
+                      wm.removeView(view);
+                  } catch (Exception ignored) {
+                  }
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent i) {
+                  return null;
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/batteryicon/overlay/MainActivity.java << 'EOF'
+          package com.batteryicon.overlay;
+
+          import android.app.Activity;
+          import android.content.*;
+          import android.net.Uri;
+          import android.os.*;
+          import android.provider.Settings;
+          import android.util.DisplayMetrics;
+          import android.widget.*;
+
+          public class MainActivity extends Activity {
+              SharedPreferences p;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  p = getSharedPreferences("cfg", MODE_PRIVATE);
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  int pad = (int) (16 * dm.density);
+
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad * 2, pad, pad);
+                  sv.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("iOS Battery Overlay");
+                  title.setTextSize(24);
+                  root.addView(title);
+
+                  addSlider(root, "Position X", "x", dm.widthPixels, 100);
+                  addSlider(root, "Position Y", "y", dm.heightPixels, 60);
+                  addSlider(root, "Size", "size", (int) (300 * dm.density), (int) (48 * dm.density));
+
+                  Button start = new Button(this);
+                  start.setText("Show battery icon");
+                  start.setOnClickListener(v -> startOverlay());
+                  root.addView(start);
+
+                  Button stop = new Button(this);
+                  stop.setText("Hide battery icon");
+                  stop.setOnClickListener(v -> {
+                      Intent i = new Intent(this, OverlayService.class);
+                      i.setAction("STOP");
+                      startService(i);
+                  });
+                  root.addView(stop);
+
+                  setContentView(sv);
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
+                  }
+              }
+
+              void addSlider(LinearLayout root, String label, String key, int max, int def) {
+                  TextView tv = new TextView(this);
+                  tv.setPadding(0, 40, 0, 0);
+                  SeekBar sb = new SeekBar(this);
+                  sb.setMax(max);
+                  int cur = p.getInt(key, def);
+                  sb.setProgress(cur);
+                  tv.setText(label + ": " + cur);
+                  sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int v, boolean user) {
+                          p.edit().putInt(key, v).apply();
+                          tv.setText(label + ": " + v);
+                          if (OverlayService.running) {
+                              startService(new Intent(MainActivity.this, OverlayService.class));
+                          }
+                      }
+
+                      @Override
+                      public void onStartTrackingTouch(SeekBar s) {
+                      }
+
+                      @Override
+                      public void onStopTrackingTouch(SeekBar s) {
+                      }
+                  });
+                  root.addView(tv);
+                  root.addView(sb);
+              }
+
+              void startOverlay() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Allow 'Display over other apps', then come back", Toast.LENGTH_LONG).show();
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:" + getPackageName())));
+                      return;
+                  }
+                  if (OverlayService.running) {
+                      startService(new Intent(this, OverlayService.class));
+                  } else {
+                      startForegroundService(new Intent(this, OverlayService.class));
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iOS-Battery-Overlay-APK
+          path: app/build/outputs/apk/debug/*.apk
